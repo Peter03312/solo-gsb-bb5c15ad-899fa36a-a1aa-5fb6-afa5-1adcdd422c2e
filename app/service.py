@@ -82,6 +82,128 @@ def evaluation_summary(result: dict[str, Any], sample: dict[str, Any]) -> dict[s
     }
 
 
+# --------------------------------------------------------------------------- 变更游标记录
+
+DEFAULT_CHANGE_LIMIT = 100
+MAX_CHANGE_LIMIT = 1000
+
+CHANGE_OP_TYPES = ("register", "event", "batch", "correction", "approve", "baseline")
+
+
+def _approval_snapshot(sample: sqlite3.Row) -> dict[str, Any] | None:
+    """核定信息快照（未核定为 None）。"""
+    if not sample["approved_storage_at"]:
+        return None
+    return {
+        "approved": True,
+        "approved_at": sample["approved_storage_at"],
+        "approver": sample["approved_by"],
+        "note": sample["approve_note"],
+    }
+
+
+def append_change_log(
+    conn: sqlite3.Connection,
+    sample: sqlite3.Row,
+    op_type: str,
+    business_id: str | None,
+    result: dict[str, Any],
+    created_at: str | None = None,
+) -> None:
+    """在当前写事务内追加一条样本核验结论变更记录（游标 = 自增行号）。
+
+    仅在实际生效提交的末尾调用：登记、单事件上报、车次批量移交（逐份）、
+    作废/替换纠错、入库核定，以及旧库升级基线。幂等重试、重复核定、冲突与
+    各类失败请求都不得调用——随事务回滚/根本不写而不产生记录。
+
+    记录的是“提交后按发生时间整体重算”的结果快照：结论类别、全部原因、
+    当前保管人、核定信息；即使结论类别未变（如 valid→valid 但保管人/核定
+    信息变化，或乱序补录后有效链变化），调用方仍须照常记录。
+    """
+    from .db import utcnow_iso
+
+    conn.execute(
+        "INSERT INTO sample_change_log"
+        " (sample_id, op_type, business_id, result_status, result_reasons_json,"
+        "  current_custodian, approval_json, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (
+            sample["id"],
+            op_type,
+            business_id,
+            result["status"],
+            json.dumps(result["reasons"], ensure_ascii=False, separators=(",", ":")),
+            result["current_custodian"],
+            json.dumps(_approval_snapshot(sample), ensure_ascii=False, separators=(",", ":"))
+            if sample["approved_storage_at"] else None,
+            created_at or utcnow_iso(),
+        ),
+    )
+
+
+def change_log_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "cursor": row["id"],
+        "sample_code": row["sample_code"],
+        "op_type": row["op_type"],
+        "business_id": row["business_id"],
+        "result_status": row["result_status"],
+        "result_reasons": json.loads(row["result_reasons_json"]),
+        "current_custodian": row["current_custodian"],
+        "approval": json.loads(row["approval_json"]) if row["approval_json"] else None,
+        "created_at": row["created_at"],
+    }
+
+
+def list_sample_changes(conn: sqlite3.Connection, cursor: int, limit: int) -> dict[str, Any]:
+    """按游标增量拉取：返回游标严格大于 cursor 的后续至多 limit 条记录（游标升序）。
+
+    无后续记录时 items 为空、next_cursor 原样回传；多取 1 行判定 has_more。
+    """
+    rows = conn.execute(
+        "SELECT cl.*, s.sample_code AS sample_code"
+        " FROM sample_change_log cl JOIN sample s ON s.id = cl.sample_id"
+        " WHERE cl.id > ? ORDER BY cl.id ASC LIMIT ?",
+        (cursor, limit + 1),
+    ).fetchall()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    items = [change_log_to_dict(r) for r in rows]
+    return {
+        "cursor": cursor,
+        "limit": limit,
+        "next_cursor": rows[-1]["id"] if rows else cursor,
+        "has_more": has_more,
+        "items": items,
+    }
+
+
+def parse_change_cursor(value: str | None) -> int:
+    """起始游标入参解析：必填、非负整数；非法明确报错（422 invalid_cursor）。"""
+    if value is None or value == "":
+        raise DomainError(422, "invalid_cursor", "缺少必填查询参数 cursor（起始游标，非负整数；首次拉取传 0）")
+    try:
+        cursor = int(value)
+    except (TypeError, ValueError):
+        raise DomainError(422, "invalid_cursor", f"非法游标: {value!r}（必须为非负整数）")
+    if cursor < 0:
+        raise DomainError(422, "invalid_cursor", f"非法游标: {value}（必须为非负整数）")
+    return cursor
+
+
+def parse_change_limit(value: str | None) -> int:
+    """条数入参解析：默认 100，区间 [1,1000]；非法明确报错（422 invalid_limit）。"""
+    if value is None or value == "":
+        return DEFAULT_CHANGE_LIMIT
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        raise DomainError(422, "invalid_limit", f"非法条数: {value!r}（必须为 1..%d 的整数）" % MAX_CHANGE_LIMIT)
+    if limit < 1 or limit > MAX_CHANGE_LIMIT:
+        raise DomainError(422, "invalid_limit", f"非法条数: {value}（必须为 1..%d 的整数）" % MAX_CHANGE_LIMIT)
+    return limit
+
+
 # --------------------------------------------------------------------------- 样本登记
 
 def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.Row, bool]:
@@ -112,6 +234,8 @@ def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.R
         (data.sample_code, canonical["collected_at"], data.collector, data.seal_no, h, utcnow_iso()),
     )
     row = conn.execute("SELECT * FROM sample WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 登记实际提交：记录一条基线变更（业务编号=样本编号，内容为重算后的当前状态）
+    append_change_log(conn, row, "register", data.sample_code, evaluate(conn, row))
     return row, False
 
 
@@ -204,6 +328,8 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
         raise DomainError(409, "event_conflict", f"事件号 {data.event_id} 并发写入且内容冲突")
 
     row = conn.execute("SELECT * FROM custody_event WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 事件实际提交：按发生时间整体重算后记录（乱序/迟到补录亦在此重算后落快照）
+    append_change_log(conn, sample, "event", data.event_id, evaluate(conn, sample))
     return row, False
 
 
@@ -565,7 +691,11 @@ def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dic
     corr_row = conn.execute(
         "SELECT * FROM event_correction WHERE id = ?", (corr_cur.lastrowid,)
     ).fetchone()
-    return _correction_result(conn, sample, corr_row), False
+    # 纠错实际生效：仅有效版本已按发生时间重算；结论类别即使未变，
+    # 有效链/原因/保管人可能已变，一律记录。
+    result = evaluate(conn, sample)
+    append_change_log(conn, sample, "correction", data.correction_id, result)
+    return {"correction": correction_to_dict(corr_row), "evaluation": result}, False
 
 
 def _correction_result(
@@ -583,14 +713,20 @@ def list_corrections(conn: sqlite3.Connection, sample_code: str) -> list[dict[st
 
 # --------------------------------------------------------------------------- 入库核定
 
-def approve_storage(conn: sqlite3.Connection, sample_code: str, data: ApproveIn) -> dict[str, Any]:
+def approve_storage(conn: sqlite3.Connection, sample_code: str, data: ApproveIn) -> tuple[dict[str, Any], bool]:
+    """入库核定。返回 (响应结果, 是否重复核定幂等命中)。
+
+    仅首次核定写入并记录一条 approve 变更（此时核定信息由无到有，即使结论
+    类别此前已是 valid 也须记录）；重复核定幂等返回、不生成记录；
+    非有效链在任何写入之前拒绝（422，随事务回滚不留记录）。
+    """
     sample = get_sample_or_404(conn, sample_code)
     result = evaluate(conn, sample)
 
     if sample["approved_storage_at"]:
         # 已核定：幂等返回，不允许借重复核定改写
         result["approval"] = {"approved": True, "approved_at": sample["approved_storage_at"], "approver": sample["approved_by"]}
-        return result
+        return result, True
 
     if result["status"] != "valid":
         raise DomainError(
@@ -607,9 +743,12 @@ def approve_storage(conn: sqlite3.Connection, sample_code: str, data: ApproveIn)
         "UPDATE sample SET approved_storage_at = ?, approved_by = ?, approve_note = ? WHERE id = ?",
         (approved_at, data.approver, data.note, sample["id"]),
     )
+    updated = conn.execute("SELECT * FROM sample WHERE id = ?", (sample["id"],)).fetchone()
+    result = evaluate(conn, updated)
     result["approved_storage_at"] = approved_at
     result["approval"] = {"approved": True, "approved_at": approved_at, "approver": data.approver, "note": data.note}
-    return result
+    append_change_log(conn, updated, "approve", sample_code, result)
+    return result, False
 
 
 # --------------------------------------------------------------------------- 车次批量移交
@@ -781,6 +920,13 @@ def submit_transfer_batch(conn: sqlite3.Connection, data: TransferBatchIn) -> tu
                 f"事件号 {it.event_id} 已被并发占用（整批失败）",
                 {"event_id": it.event_id},
             )
+
+    # 批次实际提交成功：与批次、事件同一事务，为每个受影响样本各记一条变更。
+    # 按提交顺序（事件行 id 升序）写入，记录游标顺序与提交可见顺序一致。
+    for it in data.items:
+        sample = sample_rows[it.sample_code]
+        result = evaluate(conn, sample)
+        append_change_log(conn, sample, "batch", data.batch_id, result)
 
     return conn.execute("SELECT * FROM transfer_batch WHERE id = ?", (batch_pk,)).fetchone(), False
 

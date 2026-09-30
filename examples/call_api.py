@@ -269,6 +269,81 @@ def main() -> None:
     print("证据链 superseded_events 中的批次归属:",
           [(e["event_id"], e.get("batch_id")) for e in r["superseded_events"]])
 
+    # 13) 游标增量拉取样本核验结论变更（实验室对接系统轮询用）
+    print("\n================ 游标增量变更 ================")
+
+    # 13.1) 首页：cursor=0 从头拉，limit=10
+    s, r = call_get("/sample-changes?cursor=0&limit=10")
+    print(f"--- 变更首页 [HTTP {s}] 本页 {len(r['items'])} 条，"
+          f"has_more={r['has_more']}，下次游标 next_cursor={r['next_cursor']} ---")
+    for ch in r["items"][-8:]:
+        biz = ch["business_id"] or "-"
+        print(f"  游标 {ch['cursor']:>4} | {ch['sample_code']:<18} | {ch['op_type']:<10}"
+              f" | 业务号 {biz:<24} | {ch['result_status']:<7} | 保管人 {ch['current_custodian']}")
+
+    # 13.2) 用 next_cursor 续拉直到无后续（has_more=false 时 next_cursor 停在最后一条）
+    cursor = r["next_cursor"]
+    total = len(r["items"])
+    while r.get("has_more"):
+        s, r = call_get(f"/sample-changes?cursor={cursor}&limit=10")
+        total += len(r["items"])
+        cursor = r["next_cursor"]
+    print(f"  ...续拉完成，累计 {total} 条，当前游标 {cursor}")
+
+    # 13.3) 无后续记录：空列表 + 原游标回传（持该游标轮询即可，不会漏也不会重）
+    s, r = call_get(f"/sample-changes?cursor={cursor}")
+    print(f"--- 无后续 [HTTP {s}] items={r['items']} next_cursor 回传={r['next_cursor']} ---")
+
+    # 13.4) 再提交一次核定，轮询游标即可只拿到增量
+    code3 = f"API-CHG-{run_id}"
+    call("POST", "/samples", {
+        "sample_code": code3,
+        "collected_at": "2026-09-30T01:00:00Z",
+        "collector": "王采集",
+        "seal_no": f"SEAL-CHG-{run_id}",
+    })
+    s, r = call("POST", f"/samples/{code3}/approve", {"approver": "质量主管", "note": "尝试核定"})
+    print(f"  待补证样本核定: HTTP {s}（422 失败不产生变更记录）")
+    # 该样本缺链，核定被拒；补上有效链再核定
+    call("POST", "/events", {
+        "event_id": f"API-CHG-T-{run_id}", "event_type": "transfer", "sample_code": code3,
+        "occurred_at": "2026-09-30T02:00:00Z",
+        "transfer_no": f"TR-CHG-{run_id}", "from_custodian": "王采集", "to_custodian": "李运输"})
+    call("POST", "/events", {
+        "event_id": f"API-CHG-R-{run_id}", "event_type": "receive", "sample_code": code3,
+        "occurred_at": "2026-09-30T03:00:00Z",
+        "transfer_no": f"TR-CHG-{run_id}", "receiver": "李运输",
+        "seal_no": f"SEAL-CHG-{run_id}"})
+    call("POST", "/events", {
+        "event_id": f"API-CHG-S-{run_id}", "event_type": "storage", "sample_code": code3,
+        "occurred_at": "2026-09-30T04:00:00Z", "custodian": "实验室"})
+    call("POST", f"/samples/{code3}/approve", {"approver": "质量主管", "note": "准予入库"})
+    s, r = call_get(f"/sample-changes?cursor={cursor}")
+    print(f"--- 增量轮询 [HTTP {s}] 仅取到游标 {cursor} 之后的 {len(r['items'])} 条 ---")
+    for ch in r["items"]:
+        ap = ch["approval"]
+        print(f"  游标 {ch['cursor']}: {ch['sample_code']} {ch['op_type']}/{ch['business_id']}"
+              f" → {ch['result_status']}，保管人={ch['current_custodian']}，"
+              f"核定={ap['approver'] if ap else None}")
+    print("  说明：422 核定失败未出现；最后一条 approve 带核定信息（结论 valid 未变也记录）")
+
+    # 13.5) 非法游标 / 条数 → 422 明确报错
+    s, r = call_get("/sample-changes")
+    print(f"--- 缺 cursor [HTTP {s}] {r['error']['code']}: {r['error']['message']} ---")
+    s, r = call_get("/sample-changes?cursor=abc")
+    print(f"--- 非法 cursor [HTTP {s}] {r['error']['code']}: {r['error']['message']} ---")
+    s, r = call_get("/sample-changes?cursor=0&limit=9999")
+    print(f"--- 非法 limit [HTTP {s}] {r['error']['code']}: {r['error']['message']} ---")
+
+
+def call_get(path: str) -> tuple[int, dict]:
+    req = urllib.request.Request(BASE + path, method="GET")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
 
 if __name__ == "__main__":
     main()

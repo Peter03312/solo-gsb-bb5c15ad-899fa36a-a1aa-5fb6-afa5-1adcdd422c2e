@@ -19,7 +19,10 @@ from .service import (
     get_sample_or_404,
     get_transfer_batch,
     list_corrections,
+    list_sample_changes,
     list_transfer_batches,
+    parse_change_cursor,
+    parse_change_limit,
     register_sample,
     submit_correction,
     submit_transfer_batch,
@@ -44,8 +47,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="样本交接链核验服务",
-    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验与入库核定",
-    version="1.2.0",
+    description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定与游标增量变更查询",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -216,9 +219,31 @@ def list_corrections_api(sample_code: str) -> dict[str, Any]:
 
 # --------------------------------------------------------------------------- 入库核定
 
-@app.post(f"{API_PREFIX}/samples/{{sample_code}}/approve", tags=["approval"])
-def approve_api(sample_code: str, data: ApproveIn) -> dict[str, Any]:
+@app.post(f"{API_PREFIX}/samples/{{sample_code}}/approve", tags=["approval"], status_code=200)
+def approve_api(sample_code: str, data: ApproveIn) -> JSONResponse:
     with db_session(immediate=True) as conn:
-        result = approve_storage(conn, sample_code, data)
+        result, idempotent = approve_storage(conn, sample_code, data)
         sample = get_sample_or_404(conn, sample_code)
-        return {"evaluation": evaluation_summary(result, dict(sample)), "approval": result["approval"]}
+        body = {"evaluation": evaluation_summary(result, dict(sample)), "approval": result["approval"]}
+    # 响应结构与历史保持一致（首次核定仍为 200；重复核定幂等返回）
+    return JSONResponse(status_code=200, content=body)
+
+
+# --------------------------------------------------------------------------- 核验结论变更（游标增量）
+
+@app.get(f"{API_PREFIX}/sample-changes", tags=["sample-changes"])
+def list_sample_changes_api(request: Request) -> dict[str, Any]:
+    """按全局递增游标增量拉取样本核验结论变更。
+
+    query:
+      cursor  必填，起始游标（非负整数；首次拉取传 0）。返回游标严格大于
+              cursor 的记录；非法（缺失/非整数/负数）→ 422 invalid_cursor。
+      limit   可选，条数，默认 100、范围 1..1000；非法 → 422 invalid_limit。
+
+    响应按游标升序给出 items 及 next_cursor；无后续记录时 items 为空、
+    next_cursor 回传原游标，调用方持原游标轮询即可。
+    """
+    cursor = parse_change_cursor(request.query_params.get("cursor"))
+    limit = parse_change_limit(request.query_params.get("limit"))
+    with db_session() as conn:
+        return list_sample_changes(conn, cursor, limit)
