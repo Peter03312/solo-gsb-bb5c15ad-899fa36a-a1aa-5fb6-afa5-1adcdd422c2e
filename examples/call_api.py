@@ -37,6 +37,16 @@ def show(title: str, status: int, resp: dict, *keys: str) -> None:
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
+def call_via_query(path: str) -> tuple[int, dict]:
+    """GET 带查询串的小工具（path 已含查询参数）。"""
+    req = urllib.request.Request(BASE + path)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode("utf-8"))
+
+
 def main() -> None:
     # 每次运行使用独立编号，脚本可任意重复执行
     run_id = uuid.uuid4().hex[:8]
@@ -268,6 +278,41 @@ def main() -> None:
     s, r = call("GET", f"/samples/{codes[0]}/chain")
     print("证据链 superseded_events 中的批次归属:",
           [(e["event_id"], e.get("batch_id")) for e in r["superseded_events"]])
+
+    # 13) 核验结论变更游标增量：实验室对接系统按游标拉取上述每一次实际提交的结论快照
+    print("\n=== 核验结论变更（游标增量）===")
+    # 增量循环：以 next_cursor 作为下一页的 after，直到某页 has_more=false
+    after = 0
+    pages = 0
+    total = 0
+    while True:
+        qs = f"/changes?after={after}&limit=5"
+        req = urllib.request.Request(BASE + qs)
+        with urllib.request.urlopen(req) as resp:
+            page = json.loads(resp.read().decode("utf-8"))
+        pages += 1
+        for item in page["items"]:
+            total += 1
+            approval = ""
+            if item.get("approval"):
+                approval = f" 核定于={item['approval']['approved_storage_at']}"
+            print(f"  游标 {item['cursor']:>3} | {item['sample_code']} | "
+                  f"{item['operation_type']}/{item['business_ref']}"
+                  f" → {item['status']} | 保管人={item['current_custodian']}{approval}")
+        if not page["has_more"]:
+            after = page["next_cursor"]
+            break
+        after = page["next_cursor"]
+    print(f"共 {pages} 页、{total} 条变更；本批终态游标={after}")
+
+    # 13.1) 从终态游标再拉：无后续 → 空列表 + 原游标
+    s, r = call_via_query(f"/changes?after={after}&limit=5")
+    print("无后续时:", json.dumps(r, ensure_ascii=False))
+
+    # 13.2) 非法游标 / 条数 → 400 明确报错
+    for path in ("/changes?after=abc", "/changes?limit=0", "/changes?limit=99999"):
+        s, r = call_via_query(path)
+        print(f"非法参数 {path} → HTTP {s} {r['error']['code']}: {r['error']['message']}")
 
 
 if __name__ == "__main__":

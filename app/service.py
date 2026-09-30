@@ -82,10 +82,136 @@ def evaluation_summary(result: dict[str, Any], sample: dict[str, Any]) -> dict[s
     }
 
 
+# --------------------------------------------------------------------------- 核验结论变更记录（游标增量）
+
+# 合法操作类型（与 change_record.operation_type 的 CHECK 约束保持一致）
+CHANGE_OP_TYPES = ("register", "event", "batch_transfer", "correction", "approval", "baseline")
+
+DEFAULT_CHANGE_LIMIT = 50
+MAX_CHANGE_LIMIT = 1000
+
+
+def _approval_snapshot(sample: sqlite3.Row) -> str | None:
+    """核定信息快照 JSON：仅在样本已核定（含基线升级时已核定的旧样本）时非空。"""
+    if not sample["approved_storage_at"]:
+        return None
+    return json.dumps(
+        {
+            "approved_storage_at": sample["approved_storage_at"],
+            "approved_by": sample["approved_by"],
+            "note": sample["approve_note"],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def append_change_record(
+    conn: sqlite3.Connection,
+    sample: sqlite3.Row,
+    result: dict[str, Any],
+    operation_type: str,
+    business_ref: str,
+    committed_at: str,
+    ref_event_type: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> int:
+    """在当前业务写事务内追加一条核验结论变更记录，返回全局递增游标。
+
+    必须由调用方在业务数据已写入、按发生时间重算（evaluate）之后、同事务提交之前调用，
+    因此记录与业务改动原子可见；失败回滚的事务不会留下任何记录，写事务 IMMEDIATE 串行
+    保证游标自增顺序与事务提交可见顺序一致。
+
+    即使结论类别（valid/pending/invalid）未变，只要有效链或核定信息变化，调用方也应记录：
+    结论快照（status/reasons/current_custodian/approval）随之反映变化。
+    """
+    if operation_type not in CHANGE_OP_TYPES:
+        raise ValueError(f"未知变更操作类型: {operation_type}")
+    cur = conn.execute(
+        "INSERT INTO change_record"
+        " (sample_id, sample_code, operation_type, business_ref, ref_event_type,"
+        "  status, reasons_json, current_custodian, detail_json, approval_json, committed_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            sample["id"],
+            sample["sample_code"],
+            operation_type,
+            business_ref,
+            ref_event_type,
+            result["status"],
+            json.dumps(result["reasons"], ensure_ascii=False, separators=(",", ":")),
+            result["current_custodian"],
+            json.dumps(detail or {}, ensure_ascii=False, separators=(",", ":")),
+            _approval_snapshot(sample),
+            committed_at,
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def write_baseline_changes(conn: sqlite3.Connection) -> int:
+    """旧库升级：为每条现存样本记录一条当前状态基线（不伪造历史操作）。
+
+    operation_type=baseline、business_ref=样本编号；已核定样本带核定信息快照。
+    返回写入条数。须在 IMMEDIATE 事务内、调用方确认此前无任何变更记录时执行。
+    """
+    from .db import utcnow_iso
+
+    committed_at = utcnow_iso()
+    count = 0
+    for sample in conn.execute("SELECT * FROM sample ORDER BY id ASC").fetchall():
+        result = evaluate(conn, sample)
+        append_change_record(
+            conn,
+            sample,
+            result,
+            "baseline",
+            sample["sample_code"],
+            committed_at,
+        )
+        count += 1
+    return count
+
+
+def change_record_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "cursor": row["id"],
+        "sample_code": row["sample_code"],
+        "operation_type": row["operation_type"],
+        "business_ref": row["business_ref"],
+        "ref_event_type": row["ref_event_type"],
+        "status": row["status"],
+        "reasons": json.loads(row["reasons_json"]),
+        "current_custodian": row["current_custodian"],
+        "detail": json.loads(row["detail_json"]),
+        "approval": json.loads(row["approval_json"]) if row["approval_json"] else None,
+        "committed_at": row["committed_at"],
+    }
+
+
+def query_changes(conn: sqlite3.Connection, after: int, limit: int) -> dict[str, Any]:
+    """游标增量查询：返回游标严格大于 after 的至多 limit 条记录（按游标升序）。
+
+    多取 1 条判断是否还有后续；无后续记录时 items 为空、next_cursor 原样返回 after。
+    """
+    rows = conn.execute(
+        "SELECT * FROM change_record WHERE id > ? ORDER BY id ASC LIMIT ?",
+        (after, limit + 1),
+    ).fetchall()
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    items = [change_record_to_dict(r) for r in page]
+    next_cursor = page[-1]["id"] if page else after
+    return {"after": after, "limit": limit, "items": items, "next_cursor": next_cursor, "has_more": has_more}
+
+
 # --------------------------------------------------------------------------- 样本登记
 
 def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.Row, bool]:
-    """返回 (样本行, 是否幂等命中已有记录)。"""
+    """返回 (样本行, 是否幂等命中已有记录)。
+
+    新建样本（实际提交）在同事务内记录一条 register 变更；同内容幂等重试不记录。
+    """
     canonical = {
         "sample_code": data.sample_code,
         "collected_at": to_utc_iso(data.collected_at),
@@ -112,6 +238,8 @@ def register_sample(conn: sqlite3.Connection, data: SampleIn) -> tuple[sqlite3.R
         (data.sample_code, canonical["collected_at"], data.collector, data.seal_no, h, utcnow_iso()),
     )
     row = conn.execute("SELECT * FROM sample WHERE id = ?", (cur.lastrowid,)).fetchone()
+    result = evaluate(conn, row)
+    append_change_record(conn, row, result, "register", data.sample_code, utcnow_iso())
     return row, False
 
 
@@ -204,6 +332,16 @@ def create_event(conn: sqlite3.Connection, data: EventIn) -> tuple[sqlite3.Row, 
         raise DomainError(409, "event_conflict", f"事件号 {data.event_id} 并发写入且内容冲突")
 
     row = conn.execute("SELECT * FROM custody_event WHERE id = ?", (cur.lastrowid,)).fetchone()
+    # 迟到事件按发生时间整体重算后再记结果：evaluate 仅按 occurred_at 排序的有效版本计算，
+    # 与录入顺序无关；即使结论类别未变，有效链变化（新事件进入有效链）也照样记录。
+    result = evaluate(conn, sample)
+    detail = {"event_id": data.event_id}
+    if data.event_type == "transfer":
+        detail["transfer_no"] = json.loads(payload_json).get("transfer_no")
+    append_change_record(
+        conn, sample, result, "event", data.event_id, utcnow_iso(),
+        ref_event_type=data.event_type, detail=detail,
+    )
     return row, False
 
 
@@ -565,7 +703,17 @@ def submit_correction(conn: sqlite3.Connection, data: CorrectionIn) -> tuple[dic
     corr_row = conn.execute(
         "SELECT * FROM event_correction WHERE id = ?", (corr_cur.lastrowid,)
     ).fetchone()
-    return _correction_result(conn, sample, corr_row), False
+    # 作废/替换改变有效链后按发生时间重算，记录每个受影响样本（纠错单样本）的结果
+    result = evaluate(conn, sample)
+    append_change_record(
+        conn, sample, result, "correction", data.correction_id, utcnow_iso(),
+        detail={
+            "action": data.action,
+            "target_event_id": data.target_event_id,
+            "new_event_id": data.new_event.event_id if data.new_event else None,
+        },
+    )
+    return {"correction": correction_to_dict(corr_row), "evaluation": result}, False
 
 
 def _correction_result(
@@ -607,8 +755,15 @@ def approve_storage(conn: sqlite3.Connection, sample_code: str, data: ApproveIn)
         "UPDATE sample SET approved_storage_at = ?, approved_by = ?, approve_note = ? WHERE id = ?",
         (approved_at, data.approver, data.note, sample["id"]),
     )
+    # 重读以取核定后字段，并记录核定信息变化（即使结论此前已是 valid，核定信息变化也记录）
+    sample = conn.execute("SELECT * FROM sample WHERE id = ?", (sample["id"],)).fetchone()
+    result = evaluate(conn, sample)
     result["approved_storage_at"] = approved_at
     result["approval"] = {"approved": True, "approved_at": approved_at, "approver": data.approver, "note": data.note}
+    append_change_record(
+        conn, sample, result, "approval", sample_code, approved_at,
+        detail={"approver": data.approver},
+    )
     return result
 
 
@@ -782,7 +937,22 @@ def submit_transfer_batch(conn: sqlite3.Connection, data: TransferBatchIn) -> tu
                 {"event_id": it.event_id},
             )
 
-    return conn.execute("SELECT * FROM transfer_batch WHERE id = ?", (batch_pk,)).fetchone(), False
+    batch_row = conn.execute("SELECT * FROM transfer_batch WHERE id = ?", (batch_pk,)).fetchone()
+    # 批量记录与批次同事务提交：为批内每个受影响样本各记一条（按提交顺序=行 id 升序，
+    # 游标连续）；business_ref 为批次号，detail 标出该份事件号/移交单号，便于按批次归因。
+    committed_at = batch_row["created_at"]
+    for ev in _batch_item_rows(conn, batch_pk):
+        srow = conn.execute("SELECT * FROM sample WHERE id = ?", (ev["sample_id"],)).fetchone()
+        result = evaluate(conn, srow)
+        append_change_record(
+            conn, srow, result, "batch_transfer", data.batch_id, committed_at,
+            ref_event_type="transfer",
+            detail={
+                "event_id": ev["event_id"],
+                "transfer_no": json.loads(ev["payload_json"])["transfer_no"],
+            },
+        )
+    return batch_row, False
 
 
 def _batch_item_rows(conn: sqlite3.Connection, batch_pk: int) -> list[sqlite3.Row]:

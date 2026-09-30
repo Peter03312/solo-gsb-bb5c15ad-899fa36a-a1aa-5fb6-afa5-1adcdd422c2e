@@ -10,6 +10,8 @@ from . import config
 from .db import db_session, init_db, row_to_dict
 from .schemas import ApproveIn, CorrectionIn, EventIn, SampleIn, TransferBatchIn
 from .service import (
+    DEFAULT_CHANGE_LIMIT,
+    MAX_CHANGE_LIMIT,
     DomainError,
     approve_storage,
     build_batch_result,
@@ -20,6 +22,7 @@ from .service import (
     get_transfer_batch,
     list_corrections,
     list_transfer_batches,
+    query_changes,
     register_sample,
     submit_correction,
     submit_transfer_batch,
@@ -45,7 +48,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验与入库核定",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -222,3 +225,41 @@ def approve_api(sample_code: str, data: ApproveIn) -> dict[str, Any]:
         result = approve_storage(conn, sample_code, data)
         sample = get_sample_or_404(conn, sample_code)
         return {"evaluation": evaluation_summary(result, dict(sample)), "approval": result["approval"]}
+
+
+# --------------------------------------------------------------------------- 核验结论变更（游标增量）
+
+def _parse_nonneg_int(raw: str, field: str) -> int:
+    """查询参数手工校验：须为 >=0 的整数，否则统一错误信封 400（避免 FastAPI 默认 422 文本）。"""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise DomainError(400, "invalid_cursor" if field == "after" else "invalid_limit",
+                          f"参数 {field} 必须是非负整数，收到: {raw!r}", {"field": field, "received": raw})
+    if value < 0:
+        raise DomainError(400, "invalid_cursor" if field == "after" else "invalid_limit",
+                          f"参数 {field} 不允许为负数: {value}", {"field": field, "received": value})
+    return value
+
+
+@app.get(f"{API_PREFIX}/changes", tags=["changes"])
+def list_changes_api(after: str = "0", limit: str = str(DEFAULT_CHANGE_LIMIT)) -> dict[str, Any]:
+    """按游标增量获取样本核验结论变更。
+
+    * ``after``：起始游标（返回游标严格大于它的记录），首次拉取传 0；非法游标 → 400 invalid_cursor；
+    * ``limit``：条数，默认 50、最大 1000；非法条数 → 400 invalid_limit；
+    * 按游标升序返回本页记录与 ``next_cursor``；无后续记录返回空列表且 ``next_cursor`` 等于 ``after``；
+    * ``has_more`` 提示是否还有后续记录（下一页以 next_cursor 作为 after 继续拉取）。
+    """
+    after_val = _parse_nonneg_int(after, "after")
+    limit_val = _parse_nonneg_int(limit, "limit")
+    if limit_val == 0:
+        raise DomainError(400, "invalid_limit", "参数 limit 必须 >=1", {"field": "limit", "received": limit_val})
+    if limit_val > MAX_CHANGE_LIMIT:
+        raise DomainError(
+            400, "invalid_limit",
+            f"参数 limit 超出上限 {MAX_CHANGE_LIMIT}",
+            {"field": "limit", "received": limit_val, "max": MAX_CHANGE_LIMIT},
+        )
+    with db_session() as conn:
+        return query_changes(conn, after_val, limit_val)

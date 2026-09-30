@@ -58,6 +58,26 @@ CREATE TABLE IF NOT EXISTS transfer_batch (
     created_at      TEXT NOT NULL
 );
 
+-- 核验结论变更记录（游标增量）：每次实际提交在业务写事务内为各受影响样本追加一行。
+-- id 即全局递增游标：AUTOINCREMENT + 写事务 BEGIN IMMEDIATE 串行，游标顺序即提交可见顺序；
+-- 失败回滚不占号、不留痕；幂等重试/重复核定不写入。
+CREATE TABLE IF NOT EXISTS change_record (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT, -- 全局递增游标
+    sample_id         INTEGER NOT NULL REFERENCES sample(id),
+    sample_code       TEXT NOT NULL,                    -- 样本编号（冗余落库，便于增量查询）
+    operation_type    TEXT NOT NULL CHECK (operation_type IN
+                        ('register','event','batch_transfer','correction','approval','baseline')),
+    business_ref      TEXT NOT NULL,                    -- 业务编号：登记/核定=样本编号，事件=事件号，
+                                                        --   纠错=纠错号，批量=批次号，基线=样本编号
+    ref_event_type    TEXT,                             -- 事件类操作的事件类型（transfer/receive/...）
+    status            TEXT NOT NULL,                    -- 提交后结论：valid/pending/invalid
+    reasons_json      TEXT NOT NULL,                    -- 提交后原因列表（JSON）
+    current_custodian TEXT NOT NULL,                    -- 提交后当前保管人
+    detail_json       TEXT NOT NULL DEFAULT '{}',       -- 操作附加明细（动作/目标事件/批次份内事件号等）
+    approval_json     TEXT,                             -- 提交后核定信息快照（仅核定/已核定基线非空）
+    committed_at      TEXT NOT NULL                     -- 提交时间（UTC ISO8601）
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 """
 
@@ -66,6 +86,7 @@ POST_MIGRATION_INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_event_effective ON custody_event(sample_id, superseded_by, occurred_at)",
     "CREATE INDEX IF NOT EXISTS idx_correction_sample ON event_correction(sample_id, id)",
     "CREATE INDEX IF NOT EXISTS idx_event_batch ON custody_event(batch_pk)",
+    "CREATE INDEX IF NOT EXISTS idx_change_sample ON change_record(sample_id, id)",
 ]
 
 # 旧库增量补列
@@ -116,7 +137,13 @@ def db_session(commit: bool = True, immediate: bool = False) -> Iterator[sqlite3
 
 
 def init_db() -> None:
-    """进程启动时建表（幂等），并对旧库执行增量迁移。"""
+    """进程启动时建表（幂等），并对旧库执行增量迁移。
+
+    旧库升级（含现存样本但无任何变更记录）时，在独立 IMMEDIATE 事务内为每条现存样本
+    补一条 ``baseline`` 当前状态基线；不伪造历史操作（operation_type 明确为基线，
+    business_ref 为样本编号、committed_at 为升级时刻）。新库/空库不产生基线，
+    升级幂等：已有任何变更记录即不再补基线。
+    """
     with db_session() as conn:
         conn.executescript(SCHEMA)
         for table, columns in _MIGRATION_COLUMNS.items():
@@ -126,6 +153,20 @@ def init_db() -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         for stmt in POST_MIGRATION_INDEXES:
             conn.execute(stmt)
+        sample_count = conn.execute("SELECT COUNT(*) FROM sample").fetchone()[0]
+        change_count = conn.execute("SELECT COUNT(*) FROM change_record").fetchone()[0]
+
+    if sample_count > 0 and change_count == 0:
+        # 延迟导入避免 db <-> service 循环依赖
+        from .service import write_baseline_changes
+
+        with db_session(immediate=True) as conn:
+            # 持写锁后复核：并发启动/多进程升级时仅一个事务会看到 0 条变更记录
+            if (
+                conn.execute("SELECT COUNT(*) FROM sample").fetchone()[0] > 0
+                and conn.execute("SELECT COUNT(*) FROM change_record").fetchone()[0] == 0
+            ):
+                write_baseline_changes(conn)
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
